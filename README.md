@@ -31,7 +31,7 @@ sourceDesign: README.md
 1. 安裝 Docker Desktop for Windows，於 Docker Desktop Settings > Kubernetes 勾選 Enable Kubernetes，套用後等待 Kubernetes running。
 2. 安裝 Helm 3，並確認 `helm.exe` 位於目前 shell 的 `PATH`。
 3. 安裝或確認 `kubectl.exe` 可用；Docker Desktop 啟用 Kubernetes 後通常會提供 docker-desktop context。
-4. 安裝 Python 3，並確認 `python --version` 可回傳版本。
+4. 安裝 OpenSSL，並確認 `openssl version` 可回傳版本；Private CA 驗測入口會用它產生本機 CA key/cert。
 5. 若使用 Lens，連線到目前 `kubectl config current-context` 顯示的 cluster；若不使用 Lens，以下 `kubectl get` 與 `helm status` 指令即為等價觀測方式。
 
 驗證指令：
@@ -43,7 +43,7 @@ helm version --short
 kubectl version --client
 kubectl config current-context
 kubectl cluster-info
-python --version
+openssl version
 kubectl get namespace
 helm list --all-namespaces
 ```
@@ -59,7 +59,7 @@ helm list --all-namespaces
 
 * 找不到 `helm` 或 `kubectl` 時，先修正 `PATH` 或重新安裝對應工具，再重新開啟 PowerShell 7。
 * `kubectl cluster-info` 無法連線時，先確認 Docker Desktop Kubernetes 已啟用、目前 context 是預期 cluster，必要時執行 `kubectl config use-context docker-desktop`。
-* Python 不可用時，安裝 Python 3 或修正 Windows App execution alias / PATH 後再執行 code stage。
+* OpenSSL 不可用時，安裝 OpenSSL 或使用等價工具產出 `private-root-ca.crt` 與 `private-root-ca.key` 後再建立 Private CA secret。
 
 ## C. DNS 與 Secret 設定
 
@@ -90,8 +90,35 @@ kubectl -n solk8sgtw describe secret solk8sgtw-dns01
 
 > 風險提示：本步驟會在目前 Kubernetes context 建立或更新 `solk8sgtw` namespace 內的 DNS-01 與 Private CA secret，並可能將 Private CA root 憑證匯入 Windows CurrentUser Root certificate store。若不確定目前 context 或不允許修改使用者信任根，請先停止。
 
+建立 namespace 與 DuckDNS/ACME secret：
+
 ```powershell
-& '3a.buildStage(sysK8sGtw)\deployPkg.tmp\1.scripts\importK8sSecret.ps1' -NonInteractive
+kubectl create namespace solk8sgtw --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n solk8sgtw create secret generic solk8sgtw-dns01 `
+  --from-literal=duckdns-token=$env:DUCKDNS_TOKEN `
+  --from-literal=token=$env:DUCKDNS_TOKEN `
+  --from-literal=acme-email=$env:ACME_EMAIL `
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+建立並匯入本機 Private CA，再建立 Kubernetes TLS secret：
+
+```powershell
+openssl genrsa -out .\private-root-ca.key 4096
+openssl req -x509 -new -nodes -key .\private-root-ca.key -sha256 -days 3650 `
+  -subj "/CN=solK8sGtw Local Private CA" `
+  -out .\private-root-ca.crt
+certutil -user -addstore Root .\private-root-ca.crt
+kubectl -n solk8sgtw create secret tls private-ca-root-tls-secret `
+  --cert=.\private-root-ca.crt `
+  --key=.\private-root-ca.key `
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+更新 DuckDNS A record 到本機驗測入口：
+
+```powershell
+curl.exe -fsS "https://www.duckdns.org/update?domains=solk8sgtw-syssysgtwdemo&token=$env:DUCKDNS_TOKEN&ip=127.0.0.1"
 ```
 
 成功判定：
@@ -115,29 +142,54 @@ certmgr.msc
 
 開啟 `certmgr.msc` 後，於 Current User 的 Trusted Root Certification Authorities 中移除本方案匯入的 Private CA root 憑證；若不確定憑證指紋，應先保留並交由維運人員確認。
 
-## D. 系統建置與部署
+## D. 使用已發布 artifact 部署
 
 對應 `solCase#1.2`、`solCase#1.3`、`setAct常例Adm部署更新Helm系統`。
 
-建置模組 image：
+產品 REPO 僅發布根目錄 `README.md`；部署時不得假設產品 REPO 內存在開發階段原始碼、建置腳本或暫存部署包。請直接使用已發布到 GHCR 的 OCI chart 與 image。
+
+設定版本與 GHCR owner：
 
 ```powershell
-& '2.codeStage(sysK8sGtw)\modK8sGtw\2.codeStage.ps1'
-& '2.codeStage(sysSysGtwDemo)\modSysGtwDemo\2.codeStage.ps1'
+$Version = '2026.5.6-3+develop'
+$ImageTag = $Version.ToLowerInvariant() -replace '\+', '_'
+$GhcrOwner = 'twmoonbear-laboratory'
 ```
 
-建置系統部署包：
+若 GHCR package 非公開，先登入 GHCR：
 
 ```powershell
-& '3a.buildStage(sysK8sGtw)\3a.buildStage.ps1'
-& '3a.buildStage(sysSysGtwDemo)\3a.buildStage.ps1'
+$env:GITHUB_GHCR_TOKEN = '<github-token-with-package-read>'
+$env:GITHUB_GHCR_TOKEN | helm registry login ghcr.io -u '<github-user>' --password-stdin
+```
+
+安裝 cert-manager CRDs；若 cluster 已有相容版本，可先用 `kubectl get crd certificates.cert-manager.io` 確認後略過：
+
+```powershell
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.20.2/cert-manager.crds.yaml
+kubectl wait --for=condition=Established crd/certificates.cert-manager.io --timeout=120s
+kubectl wait --for=condition=Established crd/clusterissuers.cert-manager.io --timeout=120s
 ```
 
 部署順序：
 
 ```powershell
-& '3a.buildStage(sysK8sGtw)\deployPkg.tmp\1.scripts\install.ps1'
-& '3a.buildStage(sysSysGtwDemo)\deployPkg.tmp\1.scripts\install.ps1'
+helm upgrade --install solk8sgtw-sysk8sgtw `
+  "oci://ghcr.io/$GhcrOwner/solk8sgtw/charts/sys-k8s-gtw" `
+  --version $Version `
+  --namespace solk8sgtw --create-namespace `
+  --set image.repository="ghcr.io/$GhcrOwner/solk8sgtw/mod-k8s-gtw" `
+  --set image.tag="$ImageTag" `
+  --set acme.email="$env:ACME_EMAIL" `
+  --wait --timeout 15m
+
+helm upgrade --install solk8sgtw-syssysgtwdemo `
+  "oci://ghcr.io/$GhcrOwner/solk8sgtw/charts/sys-sys-gtw-demo" `
+  --version $Version `
+  --namespace solk8sgtw --create-namespace `
+  --set image.repository="ghcr.io/$GhcrOwner/solk8sgtw/mod-sys-gtw-demo" `
+  --set image.tag="$ImageTag" `
+  --wait --timeout 10m
 ```
 
 成功判定：
@@ -150,8 +202,8 @@ certmgr.msc
 解除安裝：
 
 ```powershell
-& '3a.buildStage(sysSysGtwDemo)\deployPkg.tmp\1.scripts\uninstall.ps1'
-& '3a.buildStage(sysK8sGtw)\deployPkg.tmp\1.scripts\uninstall.ps1'
+helm -n solk8sgtw uninstall solk8sgtw-syssysgtwdemo
+helm -n solk8sgtw uninstall solk8sgtw-sysk8sgtw
 ```
 
 ## E. TLS 憑證代辦驗測
@@ -241,8 +293,11 @@ curl.exe --ipv4 --ssl-no-revoke -sS -w '\nHTTP_STATUS=%{http_code}\n' https://so
 
 部署組態來源為 README `<IV.A 部署組態>`：
 
-* 開發 REPO：`https://github.com/twMoonBear-Laboratory/solK8sGtw1`
 * 產品 REPO：`https://github.com/twStellerWhale-Ocean2/solK8sGtw1`
-* productReadme 來源：`3b.buildStage(solK8sGtw)/productReadme.md`
+* 產品 README：產品 REPO 根目錄 `README.md`
+* OCI chart：`oci://ghcr.io/twmoonbear-laboratory/solk8sgtw/charts/sys-k8s-gtw`
+* OCI chart：`oci://ghcr.io/twmoonbear-laboratory/solk8sgtw/charts/sys-sys-gtw-demo`
+* OCI image：`ghcr.io/twmoonbear-laboratory/solk8sgtw/mod-k8s-gtw`
+* OCI image：`ghcr.io/twmoonbear-laboratory/solk8sgtw/mod-sys-gtw-demo`
 
-產品 REPO 根目錄 `README.md` 由本 `productReadme` 發布；`3b.buildStage(solK8sGtw)/3b.buildStage.ps1` 產出 `3b.buildStage(solK8sGtw)/deployPkg.tmp/productReadme/README.md` 作為發布來源。
+產品使用者只需要本 README、Kubernetes/Helm 工具、GHCR 上的 OCI artifacts，以及 DNS/ACME 所需憑證或 token；不需要開發 REPO 的 stage 目錄。
