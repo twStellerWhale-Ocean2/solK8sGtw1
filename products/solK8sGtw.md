@@ -1,6 +1,6 @@
 ---
 name: solK8sGtw
-version: 1.2026.5-2.4+acceptance
+version: 2026.5.6-3+develop
 source: 3b.buildStage(solK8sGtw)/manual.md
 developRepo: https://github.com/twMoonBear-Laboratory/solK8sGtw1
 productRepo: https://github.com/twStellerWhale-Ocean2/solK8sGtw1
